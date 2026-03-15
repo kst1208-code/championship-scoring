@@ -474,13 +474,33 @@ function LiveResults({ teams, setTeams, events, sc }) {
     if (!resultsUrl.trim()) return;
     setStatus("loading"); setError("");
     try {
-      let baseUrl = resultsUrl.trim();
-      if (!baseUrl.endsWith("/")) baseUrl += "/";
-      const resp = await fetch(`/api/results?mode=index&url=${encodeURIComponent(baseUrl)}`);
-      const data = await resp.json();
-      if (data.error) { setError(data.error); setStatus("error"); return; }
-      if (!data.links || data.links.length === 0) { setError("No event links found on that page. Make sure this is a HyTek results URL."); setStatus("error"); return; }
-      setEventLinks(data.links);
+      let baseUrl = resultsUrl.trim().replace(/\/$/, '');
+      // If URL doesn't end in .htm, try appending index.htm
+      const tryUrls = [baseUrl];
+      if (!baseUrl.endsWith('.htm')) {
+        tryUrls.push(baseUrl + '/index.htm');
+        tryUrls.push(baseUrl + '/');
+      }
+
+      let foundLinks = [];
+      let lastErr = "";
+
+      for (const tryUrl of tryUrls) {
+        try {
+          const resp = await fetch(`/api/results?mode=index&url=${encodeURIComponent(tryUrl)}`);
+          const data = await resp.json();
+          if (data.error) { lastErr = data.error; continue; }
+          if (data.links && data.links.length > 0) { foundLinks = data.links; break; }
+          lastErr = "No event links found on that page.";
+        } catch (e) { lastErr = e.message; }
+      }
+
+      if (foundLinks.length === 0) {
+        setError(`${lastErr} Make sure this is a direct HyTek results URL (e.g. https://sidearmstats.com/big12/swim/index.htm).`);
+        setStatus("error");
+        return;
+      }
+      setEventLinks(foundLinks);
       setStatus("connected");
     } catch (e) { setError(`Connection failed: ${e.message}`); setStatus("error"); }
   };
@@ -568,7 +588,7 @@ function LiveResults({ teams, setTeams, events, sc }) {
       {/* Connection */}
       <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 10 }}>Connect to Live Results</div>
       <div style={{ fontSize: 12, color: "#475569", marginBottom: 12, lineHeight: 1.5 }}>
-        Paste the URL of a HyTek meet results page (e.g. from swimmeetresults.tech). The app will fetch event results and import placements automatically.
+        Paste the direct HyTek results URL — the one ending in <span style={{ color: "#818cf8" }}>index.htm</span>. This is usually the URL your meet host shares (e.g. sidearmstats.com, collegeswimming.com, or your conference's results site). Note: swimmeetresults.tech is a wrapper and may not work directly — use the underlying source URL instead.
       </div>
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <input value={resultsUrl} onChange={e => setResultsUrl(e.target.value)} placeholder="https://swimmeetresults.tech/Your-Meet-2026/"

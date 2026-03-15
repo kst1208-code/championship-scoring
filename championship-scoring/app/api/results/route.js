@@ -1,14 +1,13 @@
 export const runtime = 'edge';
 
 function parseEventPage(html, url) {
-  // Extract the pre-formatted text content from HyTek HTML
-  // HyTek pages wrap everything in <pre> tags
   const preMatch = html.match(/<pre[^>]*>([\s\S]*?)<\/pre>/i);
-  const text = preMatch ? preMatch[1].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&#39;/g, "'") : html.replace(/<[^>]+>/g, '');
+  const text = preMatch
+    ? preMatch[1].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&#39;/g, "'").replace(/&#x27;/g, "'")
+    : html.replace(/<[^>]+>/g, '');
 
   const lines = text.split('\n');
 
-  // Detect event header: "Event NN  ..."
   let eventNum = null;
   let eventName = null;
   let isRelay = false;
@@ -27,26 +26,24 @@ function parseEventPage(html, url) {
 
   if (!eventNum || isTimeTrial) return null;
 
-  // Determine if this is a finals or prelims page from the URL and content
-  const isPrelims = /P\d+\.htm/i.test(url) || lines.some(l => /^={5,}/.test(l.trim()) && !lines.some(l2 => /Finals\s+Points|Finals Points/i.test(l2)));
-  const hasPoints = lines.some(l => /Finals\s+Points|Finals Points/i.test(l));
+  const hasPoints = lines.some(l => /Finals\s+Points|Finals\s+Points/i.test(l));
+  if (!hasPoints) return null;
 
-  if (!hasPoints) return null; // Skip prelims-only pages
-
-  // Parse result lines
-  // Individual: "  1 Name, First          JR School         1:23.45   1:22.67   20"
-  // Relay: "  1 School Name          1:23.45   1:22.67   40"
   const results = [];
   let currentSection = null;
 
   for (const line of lines) {
-    // Detect section headers
-    if (/===.*Championship Final.*===/i.test(line) || /===.*A Final.*===/i.test(line)) {
+    // Handle both formats:
+    // "=== Championship Final ===" / "=== Consolation Final ===" / "=== Bonus Final ==="
+    // "=== A - Final ===" / "=== B - Final ===" / "=== C - Final ==="
+    if (/===.*(?:Championship Final|A\s*-?\s*Final).*===/i.test(line)) {
       currentSection = 'A';
-    } else if (/===.*Consolation Final.*===/i.test(line) || /===.*B Final.*===/i.test(line)) {
+    } else if (/===.*(?:Consolation Final|B\s*-?\s*Final).*===/i.test(line)) {
       currentSection = 'B';
-    } else if (/===.*Bonus Final.*===/i.test(line) || /===.*C Final.*===/i.test(line)) {
+    } else if (/===.*(?:Bonus Final|C\s*-?\s*Final).*===/i.test(line)) {
       currentSection = 'C';
+    } else if (/===.*D\s*-?\s*Final.*===/i.test(line)) {
+      currentSection = 'D';
     } else if (/===.*Preliminaries.*===/i.test(line)) {
       currentSection = 'prelims';
     } else if (/===.*Time Trial.*===/i.test(line)) {
@@ -55,9 +52,10 @@ function parseEventPage(html, url) {
 
     if (currentSection === 'prelims' || currentSection === 'timetrial') continue;
 
-    // Match result lines: start with place number, end with points
-    // Individual pattern: place, name, year, school, times, points
-    // Relay pattern: place, school, times, points
+    // Match result lines: place number at start, points at end
+    // Points may be followed by qualifier letters like A, B, or record markers like *, #, !
+    // Example: "  1 Kharun, Ilya       JR ASU       44.25    43.77#   32"
+    // Example: "  1 Reyna, Alexa       JR ASU       4:19.20  4:09.22A 32"
     const resultMatch = line.match(/^\s*(\d{1,3})\s+(.+?)\s+(\d+)\s*$/);
     if (!resultMatch) continue;
 
@@ -67,25 +65,22 @@ function parseEventPage(html, url) {
 
     if (place < 1 || place > 50 || points < 0 || points > 200) continue;
 
-    // Extract school name from the middle section
-    // For individual events, school is between the year code and the times
-    // For relays, school is the first field
     let school = null;
 
     if (isRelay) {
       // Relay: "School Name         1:23.45   1:22.67"
-      // School ends before the first time pattern
       const timeIdx = middle.search(/\d+:\d{2}\.\d{2}|\d{2}\.\d{2}/);
       if (timeIdx > 0) {
         school = middle.substring(0, timeIdx).trim();
       }
     } else {
       // Individual: "Name, First       JR School Name     1:23.45   1:22.67"
-      // Year codes: FR, SO, JR, SR, 5Y
-      const yearMatch = middle.match(/\s(FR|SO|JR|SR|5Y|GR)\s+/);
+      // Also handle GS (grad student) year code
+      const yearMatch = middle.match(/\s(FR|SO|JR|SR|5Y|GR|GS)\s+/);
       if (yearMatch) {
         const afterYear = middle.substring(yearMatch.index + yearMatch[0].length);
-        const timeIdx = afterYear.search(/\d+:\d{2}\.\d{2}|\d{2}\.\d{2}/);
+        // Time pattern: 1:23.45 or 23.45 — possibly followed by qualifier letters
+        const timeIdx = afterYear.search(/\d+:\d{2}\.\d{2}[A-Z*#!]*|\d{2}\.\d{2}[A-Z*#!]*/);
         if (timeIdx > 0) {
           school = afterYear.substring(0, timeIdx).trim();
         }
@@ -102,7 +97,7 @@ function parseEventPage(html, url) {
   const rankPattern = /(\d+)\.\s+(.+?)\s{2,}(\d+(?:\.\d+)?)/g;
   let rankMatch;
   const fullText = lines.join('\n');
-  const rankSection = fullText.match(/Team Rankings.*?$([\s\S]*?)(?=\n\s*\n\s*\n|\s*$)/m);
+  const rankSection = fullText.match(/Team Rankings[\s\S]*$/m);
   if (rankSection) {
     const rankText = rankSection[0];
     while ((rankMatch = rankPattern.exec(rankText)) !== null) {
@@ -110,85 +105,106 @@ function parseEventPage(html, url) {
     }
   }
 
-  return {
-    eventNum,
-    eventName,
-    isRelay,
-    results,
-    rankings,
-    url,
-  };
+  return { eventNum, eventName, isRelay, results, rankings, url };
 }
 
 function parseIndexPage(html, baseUrl) {
-  // HyTek index pages list events as links
-  // Pattern: <a href="YYMMDDP001.htm">Event 1 ...</a> or similar
+  // HyTek uses framesets. The main page has frames pointing to evtindex.htm etc.
+  // First check if this IS a frameset — if so, extract the frame src URLs
+  const frameLinks = [];
+  const framePattern = /<frame[^>]+src=["']([^"']+)["']/gi;
+  let fm;
+  while ((fm = framePattern.exec(html)) !== null) {
+    frameLinks.push(fm[1]);
+  }
+
+  if (frameLinks.length > 0) {
+    // This is a frameset page — return the frame URLs so the client can fetch the event index frame
+    return { type: 'frameset', frames: frameLinks.map(f => new URL(f, baseUrl).href) };
+  }
+
+  // Not a frameset — parse event links directly
   const links = [];
   const linkPattern = /<a[^>]+href=["']([^"']+\.htm)["'][^>]*>([\s\S]*?)<\/a>/gi;
   let match;
   while ((match = linkPattern.exec(html)) !== null) {
     const href = match[1];
     const text = match[2].replace(/<[^>]+>/g, '').trim();
-    // Only include finals pages (F###.htm), skip prelims (P###.htm) unless no finals exist
     if (/F\d+\.htm$/i.test(href) || /\d+\.htm$/i.test(href)) {
       const fullUrl = new URL(href, baseUrl).href;
       links.push({ url: fullUrl, text });
     }
   }
-  return links;
+  return { type: 'eventlist', links };
+}
+
+// Resolve swimmeetresults.tech URLs to their underlying HyTek source
+function resolveUrl(url) {
+  // swimmeetresults.tech wraps HyTek pages in a JS app
+  // The underlying data is usually at a different domain
+  // Users should paste the direct HyTek URL instead
+  // But we can try common patterns
+  return url;
 }
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const targetUrl = searchParams.get('url');
-  const mode = searchParams.get('mode') || 'event'; // 'index' or 'event'
+  const mode = searchParams.get('mode') || 'event';
 
   if (!targetUrl) {
-    return new Response(JSON.stringify({ error: 'Missing url parameter' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return Response.json({ error: 'Missing url parameter' }, { status: 400 });
   }
 
-  // Basic URL validation
-  try {
-    new URL(targetUrl);
-  } catch {
-    return new Response(JSON.stringify({ error: 'Invalid URL' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  try { new URL(targetUrl); } catch {
+    return Response.json({ error: 'Invalid URL' }, { status: 400 });
   }
 
   try {
-    const resp = await fetch(targetUrl, {
+    const resolved = resolveUrl(targetUrl);
+    const resp = await fetch(resolved, {
       headers: { 'User-Agent': 'ChampionshipScoring/1.0' },
     });
 
     if (!resp.ok) {
-      return new Response(JSON.stringify({ error: `Failed to fetch: ${resp.status}` }), {
-        status: 502,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return Response.json({ error: `Failed to fetch: ${resp.status}. If using swimmeetresults.tech, try the direct HyTek URL instead (check the page source for the underlying results site).` }, { status: 502 });
     }
 
     const html = await resp.text();
 
     if (mode === 'index') {
-      const links = parseIndexPage(html, targetUrl);
-      return new Response(JSON.stringify({ links }), {
+      const result = parseIndexPage(html, resolved);
+
+      if (result.type === 'frameset') {
+        // Fetch each frame to find the event list
+        let allLinks = [];
+        for (const frameUrl of result.frames) {
+          try {
+            const frameResp = await fetch(frameUrl, { headers: { 'User-Agent': 'ChampionshipScoring/1.0' } });
+            if (frameResp.ok) {
+              const frameHtml = await frameResp.text();
+              const frameResult = parseIndexPage(frameHtml, frameUrl);
+              if (frameResult.type === 'eventlist' && frameResult.links.length > 0) {
+                allLinks = allLinks.concat(frameResult.links);
+              }
+            }
+          } catch (e) { /* skip failed frame fetches */ }
+        }
+        return Response.json({ links: allLinks, frames: result.frames }, {
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=30' },
+        });
+      }
+
+      return Response.json({ links: result.links }, {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=30' },
       });
     } else {
-      const parsed = parseEventPage(html, targetUrl);
-      return new Response(JSON.stringify({ event: parsed }), {
+      const parsed = parseEventPage(html, resolved);
+      return Response.json({ event: parsed }, {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=30' },
       });
     }
   } catch (err) {
-    return new Response(JSON.stringify({ error: `Fetch error: ${err.message}` }), {
-      status: 502,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return Response.json({ error: `Fetch error: ${err.message}` }, { status: 502 });
   }
 }
