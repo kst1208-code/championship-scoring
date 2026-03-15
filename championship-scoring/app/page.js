@@ -202,7 +202,7 @@ function Header({ view, setView, meetName, setMeetName, onReset }) {
           <button onClick={onReset} style={{ background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 6, padding: "6px 10px", color: "#fca5a5", fontSize: 11, cursor: "pointer", fontWeight: 600 }}>Reset All</button>
         </div>
         <div style={{ display: "flex", gap: 4, overflowX: "auto", paddingBottom: 2 }}>
-          {[{ key: "dashboard", label: "Dashboard", icon: "◉" }, { key: "scoring", label: "Scoring", icon: "✦" }, { key: "events", label: "Events", icon: "☰" }, { key: "psych", label: "Psych Sheets", icon: "⊞" }, { key: "scenario", label: "What-If", icon: "⚡" }].map(t => (
+          {[{ key: "dashboard", label: "Dashboard", icon: "◉" }, { key: "scoring", label: "Scoring", icon: "✦" }, { key: "events", label: "Events", icon: "☰" }, { key: "psych", label: "Psych Sheets", icon: "⊞" }, { key: "live", label: "Live", icon: "◈" }, { key: "scenario", label: "What-If", icon: "⚡" }].map(t => (
             <button key={t.key} onClick={() => setView(t.key)} style={{
               background: view === t.key ? "rgba(56,189,248,0.15)" : "transparent", border: view === t.key ? "1px solid rgba(56,189,248,0.3)" : "1px solid transparent",
               borderRadius: 6, padding: "7px 14px", color: view === t.key ? "#38bdf8" : "#64748b", fontSize: 12, cursor: "pointer", fontWeight: view === t.key ? 700 : 500, whiteSpace: "nowrap", transition: "all 0.15s",
@@ -458,6 +458,205 @@ function WhatIfScenario({ teams, events, sc }) {
   );
 }
 
+// ─── LIVE RESULTS ──────────────────────────────────────────────────
+function LiveResults({ teams, setTeams, events, sc }) {
+  const [resultsUrl, setResultsUrl] = useState("");
+  const [status, setStatus] = useState("idle"); // idle, loading, connected, error
+  const [eventLinks, setEventLinks] = useState([]);
+  const [parsedEvents, setParsedEvents] = useState([]);
+  const [teamMap, setTeamMap] = useState({}); // maps result school names -> team index
+  const [error, setError] = useState("");
+  const [lastPoll, setLastPoll] = useState(null);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+
+  // Fetch the index page to discover event links
+  const connectToMeet = async () => {
+    if (!resultsUrl.trim()) return;
+    setStatus("loading"); setError("");
+    try {
+      let baseUrl = resultsUrl.trim();
+      if (!baseUrl.endsWith("/")) baseUrl += "/";
+      const resp = await fetch(`/api/results?mode=index&url=${encodeURIComponent(baseUrl)}`);
+      const data = await resp.json();
+      if (data.error) { setError(data.error); setStatus("error"); return; }
+      if (!data.links || data.links.length === 0) { setError("No event links found on that page. Make sure this is a HyTek results URL."); setStatus("error"); return; }
+      setEventLinks(data.links);
+      setStatus("connected");
+    } catch (e) { setError(`Connection failed: ${e.message}`); setStatus("error"); }
+  };
+
+  // Fetch and parse all finals events
+  const fetchAllResults = async () => {
+    if (eventLinks.length === 0) return;
+    setStatus("loading");
+    const results = [];
+    // Only fetch finals pages (F in the filename)
+    const finalsLinks = eventLinks.filter(l => /F\d+\.htm/i.test(l.url));
+    for (const link of finalsLinks) {
+      try {
+        const resp = await fetch(`/api/results?mode=event&url=${encodeURIComponent(link.url)}`);
+        const data = await resp.json();
+        if (data.event) results.push(data.event);
+      } catch (e) { /* skip failed fetches */ }
+    }
+    setParsedEvents(results);
+    setLastPoll(new Date());
+    setStatus("connected");
+
+    // Auto-detect team names from results
+    const schoolNames = new Set();
+    results.forEach(ev => ev.results.forEach(r => schoolNames.add(r.school)));
+    const newMap = { ...teamMap };
+    schoolNames.forEach(s => {
+      if (newMap[s] === undefined) {
+        // Try to auto-match to existing teams
+        const matchIdx = teams.findIndex(t => t.name && (
+          t.name.toLowerCase() === s.toLowerCase() ||
+          s.toLowerCase().includes(t.name.toLowerCase()) ||
+          t.name.toLowerCase().includes(s.toLowerCase())
+        ));
+        if (matchIdx >= 0) newMap[s] = matchIdx;
+      }
+    });
+    setTeamMap(newMap);
+  };
+
+  // Apply results to team seeds
+  const applyResults = () => {
+    const next = teams.map(t => ({ ...t, seeds: { ...t.seeds } }));
+    let maxEventApplied = 0;
+
+    parsedEvents.forEach(ev => {
+      ev.results.forEach(r => {
+        const teamIdx = teamMap[r.school];
+        if (teamIdx === undefined || teamIdx < 0) return;
+        const key = `${ev.eventNum}-${r.place}`;
+        next[teamIdx].seeds[key] = true;
+        if (ev.eventNum > maxEventApplied) maxEventApplied = ev.eventNum;
+      });
+    });
+
+    // Update actual scores from team rankings if available
+    const latestRankings = parsedEvents.filter(e => e.rankings.length > 0).sort((a, b) => b.eventNum - a.eventNum)[0];
+    if (latestRankings) {
+      latestRankings.rankings.forEach(r => {
+        const teamIdx = Object.entries(teamMap).find(([school]) =>
+          r.team.toLowerCase().includes(school.toLowerCase()) || school.toLowerCase().includes(r.team.toLowerCase())
+        );
+        if (teamIdx && teamIdx[1] >= 0) {
+          next[teamIdx[1]].currentScore = r.score;
+          next[teamIdx[1]].thruEvent = latestRankings.eventNum;
+        }
+      });
+    }
+
+    setTeams(next);
+  };
+
+  // Auto-refresh polling
+  useEffect(() => {
+    if (!autoRefresh || eventLinks.length === 0) return;
+    const interval = setInterval(() => { fetchAllResults(); }, 90000); // 90 second poll
+    return () => clearInterval(interval);
+  }, [autoRefresh, eventLinks]);
+
+  const unmappedSchools = [...new Set(parsedEvents.flatMap(e => e.results.map(r => r.school)))].filter(s => teamMap[s] === undefined);
+  const mappedSchools = Object.entries(teamMap).filter(([_, v]) => v !== undefined && v >= 0);
+
+  return (
+    <div style={{ maxWidth: 900, margin: "0 auto", padding: "16px 16px 100px" }}>
+      {/* Connection */}
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 10 }}>Connect to Live Results</div>
+      <div style={{ fontSize: 12, color: "#475569", marginBottom: 12, lineHeight: 1.5 }}>
+        Paste the URL of a HyTek meet results page (e.g. from swimmeetresults.tech). The app will fetch event results and import placements automatically.
+      </div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <input value={resultsUrl} onChange={e => setResultsUrl(e.target.value)} placeholder="https://swimmeetresults.tech/Your-Meet-2026/"
+          onKeyDown={e => e.key === "Enter" && connectToMeet()}
+          style={{ flex: 1, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, padding: "10px 14px", color: "#e2e8f0", fontSize: 13, outline: "none" }} />
+        <button onClick={connectToMeet} disabled={status === "loading"} style={{
+          background: status === "connected" ? "rgba(34,197,94,0.15)" : "rgba(56,189,248,0.15)",
+          border: status === "connected" ? "1px solid rgba(34,197,94,0.3)" : "1px solid rgba(56,189,248,0.3)",
+          borderRadius: 8, padding: "10px 20px", color: status === "connected" ? "#4ade80" : "#38bdf8",
+          fontSize: 12, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap",
+        }}>{status === "loading" ? "Loading..." : status === "connected" ? "Reconnect" : "Connect"}</button>
+      </div>
+      {error && <div style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 8, padding: "10px 14px", color: "#fca5a5", fontSize: 12, marginBottom: 16 }}>{error}</div>}
+
+      {/* Connected state */}
+      {status === "connected" && eventLinks.length > 0 && (
+        <>
+          {/* Status bar */}
+          <div style={{ background: "rgba(34,197,94,0.06)", border: "1px solid rgba(34,197,94,0.15)", borderRadius: 10, padding: "12px 16px", marginBottom: 20, display: "flex", gap: 24, flexWrap: "wrap", alignItems: "center" }}>
+            <div><div style={{ fontSize: 10, color: "#64748b", fontWeight: 600, textTransform: "uppercase" }}>Event pages</div><div style={{ fontSize: 18, fontWeight: 800, color: "#4ade80" }}>{eventLinks.length}</div></div>
+            <div><div style={{ fontSize: 10, color: "#64748b", fontWeight: 600, textTransform: "uppercase" }}>Parsed</div><div style={{ fontSize: 18, fontWeight: 800, color: "#4ade80" }}>{parsedEvents.length}</div></div>
+            <div><div style={{ fontSize: 10, color: "#64748b", fontWeight: 600, textTransform: "uppercase" }}>Last poll</div><div style={{ fontSize: 14, fontWeight: 600, color: "#94a3b8" }}>{lastPoll ? lastPoll.toLocaleTimeString() : "—"}</div></div>
+            <button onClick={fetchAllResults} disabled={status === "loading"} style={{
+              background: "rgba(56,189,248,0.1)", border: "1px solid rgba(56,189,248,0.2)", borderRadius: 6, padding: "6px 14px", color: "#38bdf8", fontSize: 11, fontWeight: 600, cursor: "pointer",
+            }}>Fetch Results</button>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#64748b", cursor: "pointer" }}>
+              <input type="checkbox" checked={autoRefresh} onChange={e => setAutoRefresh(e.target.checked)} style={{ accentColor: "#38bdf8" }} />
+              Auto-refresh (90s)
+            </label>
+          </div>
+
+          {/* Team mapping */}
+          {parsedEvents.length > 0 && (
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 10 }}>
+                Team Mapping — Match result teams to your teams
+              </div>
+              <div style={{ fontSize: 12, color: "#475569", marginBottom: 12, lineHeight: 1.5 }}>
+                Teams from the results need to be mapped to your team list. The app auto-matches by name when possible. Fix any that are wrong or unmapped.
+              </div>
+              {[...new Set(parsedEvents.flatMap(e => e.results.map(r => r.school)))].sort().map(school => (
+                <div key={school} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.05)", borderRadius: 8, padding: "6px 12px" }}>
+                  <div style={{ flex: 1, fontSize: 13, color: teamMap[school] !== undefined && teamMap[school] >= 0 ? "#4ade80" : "#94a3b8", fontWeight: 600 }}>{school}</div>
+                  <span style={{ fontSize: 11, color: "#475569" }}>→</span>
+                  <select value={teamMap[school] !== undefined ? teamMap[school] : -1}
+                    onChange={e => setTeamMap({ ...teamMap, [school]: parseInt(e.target.value) })}
+                    style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 6, padding: "5px 8px", color: "#e2e8f0", fontSize: 12, outline: "none" }}>
+                    <option value={-1}>— Skip —</option>
+                    {teams.map((t, i) => t.name && <option key={i} value={i}>{t.name}</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Apply button */}
+          {parsedEvents.length > 0 && (
+            <button onClick={applyResults} style={{
+              width: "100%", background: "linear-gradient(135deg, rgba(34,197,94,0.2), rgba(56,189,248,0.2))",
+              border: "1px solid rgba(34,197,94,0.3)", borderRadius: 10, padding: "14px",
+              color: "#4ade80", fontSize: 14, fontWeight: 700, cursor: "pointer",
+              marginBottom: 20,
+            }}>Apply Results to Psych Sheets ({parsedEvents.length} events)</button>
+          )}
+
+          {/* Parsed events summary */}
+          {parsedEvents.length > 0 && (
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 10 }}>Fetched Events</div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {parsedEvents.map(ev => (
+                  <div key={ev.eventNum} style={{
+                    background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 6, padding: "6px 10px",
+                  }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: "#94a3b8" }}>#{ev.eventNum}</div>
+                    <div style={{ fontSize: 10, color: "#475569" }}>{ev.eventName?.substring(0, 25)}</div>
+                    <div style={{ fontSize: 10, color: ev.isRelay ? "#818cf8" : "#475569" }}>{ev.results.length} results</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 // ─── MAIN APP ──────────────────────────────────────────────────────
 export default function ChampionshipScoring() {
   const [view, setView] = useState("dashboard");
@@ -497,6 +696,7 @@ export default function ChampionshipScoring() {
       {view === "scoring" && <ScoringSetup scoringConfig={sc} setScoringConfig={setSc} />}
       {view === "events" && <EventSetup events={events} setEvents={setEvents} />}
       {view === "psych" && <PsychSheet teams={teams} setTeams={setTeams} events={events} sc={sc} activeTeam={activeTeam} setActiveTeam={setActiveTeam} />}
+      {view === "live" && <LiveResults teams={teams} setTeams={setTeams} events={events} sc={sc} />}
       {view === "scenario" && <WhatIfScenario teams={teams} events={events} sc={sc} />}
     </div>
   );
